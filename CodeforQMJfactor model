@@ -1,0 +1,263 @@
+import pandas as pd
+import numpy as np
+import os
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
+from urllib.parse import quote_plus
+from scipy.stats import ttest_1samp
+import statsmodels.api as sm
+
+# -----------------------------
+# Step 0: Setup and WRDS Connection
+# -----------------------------
+start_date = "2010-01-01"
+end_date = "2023-12-31"
+
+load_dotenv()
+wrds_user = os.getenv("WRDS_USER")
+wrds_password = os.getenv("WRDS_PASSWORD")
+if not wrds_user or not wrds_password:
+    raise ValueError("Missing WRDS credentials.")
+
+encoded_password = quote_plus(wrds_password)
+connection_string = (
+    f"postgresql+psycopg2://{wrds_user}:{encoded_password}"
+    "@wrds-pgdata.wharton.upenn.edu:9737/wrds"
+)
+engine = create_engine(connection_string, pool_pre_ping=True)
+print("Connected to WRDS.")
+
+# -----------------------------
+# Step 1: Retrieve CRSP Data
+# -----------------------------
+crsp_query = f"""
+SELECT msf.permno, 
+       date_trunc('month', msf.mthcaldt)::date AS date, 
+       msf.mthret AS ret, 
+       CAST(msf.shrout AS BIGINT) AS shrout, 
+       msf.mthprc AS altprc
+FROM crsp.msf_v2 AS msf
+WHERE msf.mthcaldt BETWEEN '{start_date}' AND '{end_date}';
+"""
+crsp_data = pd.read_sql_query(crsp_query, engine)
+crsp_data["date"] = pd.to_datetime(crsp_data["date"])
+# Convert shrout (in thousands) to actual shares outstanding
+crsp_data["shrout"] = crsp_data["shrout"].astype(float) * 1000
+crsp_data["permno"] = crsp_data["permno"].astype(int)
+print(f"Retrieved CRSP data: {crsp_data.shape}")
+
+# -----------------------------
+# Step 2: Retrieve Compustat Data
+# -----------------------------
+# We augment the query to retrieve debt information (dltt and dlc) needed for leverage.
+compustat_query = f"""
+SELECT gvkey, 
+       datadate, 
+       at AS total_assets,
+       dltt, 
+       dlc,
+       revt, 
+       cogs, 
+       xsga, 
+       CASE WHEN at > 0 THEN ni/at ELSE NULL END AS roa
+FROM comp.funda
+WHERE indfmt = 'INDL' 
+  AND datafmt = 'STD' 
+  AND popsrc = 'D'
+  AND consol = 'C'
+  AND at > 0
+  AND datadate BETWEEN '{start_date}' AND '{end_date}';
+"""
+compustat_data = pd.read_sql_query(compustat_query, engine)
+compustat_data.rename(columns={'datadate': 'date'}, inplace=True)
+compustat_data["date"] = pd.to_datetime(compustat_data["date"])
+compustat_data["gvkey"] = compustat_data["gvkey"].astype(str)
+print(f"Retrieved Compustat data: {compustat_data.shape}")
+
+# (Optional) You might compute additional measures here—for example, operating profitability—but in this version we focus on leverage and volatility.
+
+# -----------------------------
+# Step 3: Retrieve the Linking Table
+# -----------------------------
+linking_table_query = f"""
+SELECT gvkey, lpermno AS permno, linkdt, linkenddt
+FROM crsp.ccmxpf_linktable
+WHERE LINKTYPE IN ('LU', 'LC')
+  AND (linkprim = 'C' OR linkprim IS NULL)
+  AND usedflag = '1'
+  AND linkdt <= '{end_date}'
+  AND (linkenddt IS NULL OR linkenddt >= '{start_date}')
+"""
+link_table = pd.read_sql_query(linking_table_query, engine)
+link_table["linkdt"] = pd.to_datetime(link_table["linkdt"])
+link_table["linkenddt"] = pd.to_datetime(link_table["linkenddt"])
+link_table["permno"] = link_table["permno"].astype(int)
+link_table["gvkey"] = link_table["gvkey"].astype(str)
+print(f"Retrieved linking table: {link_table.shape}")
+
+# -----------------------------
+# Step 4: Check Overlap Between CRSP and Linking Table
+# -----------------------------
+crsp_permnos = set(crsp_data["permno"].unique())
+link_permnos = set(link_table["permno"].unique())
+common_permnos = crsp_permnos.intersection(link_permnos)
+print("Number of overlapping permno between CRSP and linking table:", len(common_permnos))
+if len(common_permnos) == 0:
+    raise ValueError(
+        "No overlapping permno found between CRSP and linking table. Double-check the linking table filters and data availability on WRDS.")
+
+# -----------------------------
+# Step 5: Merge CRSP with Linking Table
+# -----------------------------
+crsp_data = crsp_data.sort_values(by=["permno", "date"])
+link_table = link_table.sort_values(by=["permno", "linkdt"])
+
+crsp_link_list = []
+for perm, group in crsp_data.groupby("permno"):
+    link_group = link_table[link_table["permno"] == perm]
+    if not link_group.empty:
+        merged_temp = pd.merge_asof(
+            group, link_group, left_on="date", right_on="linkdt",
+            by="permno", direction="backward"
+        )
+        merged_temp = merged_temp[(merged_temp["linkenddt"].isna()) | (merged_temp["date"] <= merged_temp["linkenddt"])]
+        if not merged_temp.empty:
+            crsp_link_list.append(merged_temp)
+if len(crsp_link_list) == 0:
+    raise ValueError("No CRSP observations matched to the linking table. Check your linking table join.")
+crsp_link = pd.concat(crsp_link_list, ignore_index=True)
+print(f"After merging CRSP with linking table: {crsp_link.shape}")
+
+# -----------------------------
+# Step 6: Merge with Compustat Data Using 1-Year Lagged Quality Info
+# -----------------------------
+# For each firm (gvkey), merge CRSP returns with the most recent Compustat observation that is at least 1 year old.
+merged_list = []
+for gv, crsp_group in crsp_link.groupby("gvkey"):
+    crsp_group = crsp_group.sort_values(by="date").copy()
+    # Create a lagged date column (1 year prior)
+    crsp_group["date_lag"] = crsp_group["date"] - pd.DateOffset(years=1)
+
+    comp_group = compustat_data[compustat_data["gvkey"] == gv].sort_values(by="date")
+    if not comp_group.empty:
+        merged_temp = pd.merge_asof(
+            crsp_group,
+            comp_group,
+            left_on="date_lag",
+            right_on="date",
+            direction="backward",
+            suffixes=("", "_comp")
+        )
+        merged_list.append(merged_temp)
+if len(merged_list) == 0:
+    raise ValueError("No merged data found after merging with Compustat. Check your data.")
+merged_data = pd.concat(merged_list, ignore_index=True)
+print(f"After merging with Compustat (using 1-year lag): {merged_data.shape}")
+
+# -----------------------------
+# Step 7: Compute Quality Score Based on Low Leverage and Low Volatility
+# -----------------------------
+# 7a. Compute Leverage (using lagged Compustat info)
+# Leverage is defined as (dltt + dlc) / total_assets.
+merged_data["leverage"] = (merged_data["dltt"] + merged_data["dlc"]) / merged_data["total_assets"]
+
+# 7b. Compute Volatility (using CRSP returns)
+# First, calculate a 12-month rolling standard deviation (volatility) on CRSP returns for each firm.
+vol_df = crsp_data[["permno", "date", "ret"]].copy()
+vol_df = vol_df.sort_values(by=["permno", "date"])
+vol_df["volatility"] = vol_df.groupby("permno")["ret"].transform(lambda x: x.rolling(window=12, min_periods=6).std())
+# Lag the volatility by one month so that only past information is used.
+vol_df["volatility_lag"] = vol_df.groupby("permno")["volatility"].shift(1)
+
+# Merge the lagged volatility into merged_data on permno and date.
+merged_data = pd.merge(merged_data, vol_df[["permno", "date", "volatility_lag"]], on=["permno", "date"], how="left")
+
+# 7c. Standardize the metrics (z-scores)
+# For quality defined as low leverage and low volatility, lower values are better.
+merged_data["leverage_z"] = (merged_data["leverage"] - merged_data["leverage"].mean()) / merged_data["leverage"].std()
+merged_data["volatility_z"] = (merged_data["volatility_lag"] - merged_data["volatility_lag"].mean()) / merged_data[
+    "volatility_lag"].std()
+
+# 7d. Define the Quality Score
+# We invert the z-scores so that stocks with lower leverage and lower volatility obtain a higher quality score.
+merged_data["quality_score"] = -0.5 * merged_data["leverage_z"] - 0.5 * merged_data["volatility_z"]
+
+
+# -----------------------------
+# Step 8: Assign Quality Quintiles by Month
+# -----------------------------
+def assign_quintile(x):
+    if x.dropna().nunique() < 2:
+        # Insufficient variation – assign the median quintile (3)
+        return pd.Series(3, index=x.index)
+    else:
+        # Create quintiles: 1 (lowest quality) to 5 (highest quality)
+        return pd.qcut(x, 5, labels=False, duplicates='drop') + 1
+
+
+merged_data["quality_quintile"] = merged_data.groupby("date")["quality_score"].transform(assign_quintile)
+
+# -----------------------------
+# Step 9: Compute Monthly Portfolio Returns by Quality Quintile
+# -----------------------------
+portfolio_returns = merged_data.groupby(["date", "quality_quintile"])["ret"].mean().reset_index()
+
+# Extract returns for the low-quality portfolio (quintile 1) and the high-quality portfolio (quintile 5)
+low_quality_returns = portfolio_returns[portfolio_returns["quality_quintile"] == 1].copy().rename(
+    columns={"ret": "low_qual_ret"})
+high_quality_returns = portfolio_returns[portfolio_returns["quality_quintile"] == 5].copy().rename(
+    columns={"ret": "high_qual_ret"})
+
+# Merge the high and low quality returns by date
+returns_merged = pd.merge(high_quality_returns[["date", "high_qual_ret"]],
+                          low_quality_returns[["date", "low_qual_ret"]],
+                          on="date", how="inner")
+
+# Compute the QMJ (Quality Minus Junk) Return: high quality return minus low quality return.
+returns_merged["qmj_ret"] = returns_merged["high_qual_ret"] - returns_merged["low_qual_ret"]
+
+# -----------------------------
+# Step 10: Inspect Selected Firms and Verify Monthly Returns
+# -----------------------------
+# Choose a sample month (adjust as needed)
+sample_month = pd.to_datetime("2015-01-31")
+sample_data = merged_data[merged_data["date"] == sample_month]
+
+high_quality_firms = sample_data[sample_data["quality_quintile"] == 5]
+print(f"High Quality Firms on {sample_month.date()}:")
+print(high_quality_firms[["permno", "gvkey", "quality_score", "quality_quintile", "ret"]].head(10))
+
+low_quality_firms = sample_data[sample_data["quality_quintile"] == 1]
+print(f"\nLow Quality Firms on {sample_month.date()}:")
+print(low_quality_firms[["permno", "gvkey", "quality_score", "quality_quintile", "ret"]].head(10))
+
+print("\nMonthly Average Returns by Quality Quintile (Sample):")
+print(portfolio_returns.head())
+
+# -----------------------------
+# Step 11: Statistical Significance Testing and Regression-based Alpha
+# -----------------------------
+# Test if the mean QMJ return is statistically different from zero.
+t_stat, p_value = ttest_1samp(returns_merged["qmj_ret"].dropna(), 0)
+print(f"\nMean QMJ Return: {returns_merged['qmj_ret'].mean():.4f}")
+print(f"T-statistic: {t_stat:.4f}, P-value: {p_value:.4f}")
+
+# Optional: Run a regression on QMJ returns to obtain an (unadjusted) alpha.
+X = np.ones(len(returns_merged))
+model = sm.OLS(returns_merged["qmj_ret"].dropna(), X).fit()
+alpha = model.params[0]
+alpha_tstat = model.tvalues[0]
+alpha_pvalue = model.pvalues[0]
+print(f"\nRegression-based (unadjusted) Alpha: {alpha:.4f}")
+print(f"Alpha t-statistic: {alpha_tstat:.4f}, p-value: {alpha_pvalue:.4f}")
+
+# -----------------------------
+# Step 12: Calculate Sharpe Ratio for QMJ Portfolio
+# -----------------------------
+# Assume a monthly risk-free rate of zero (adjust if you have a risk-free rate).
+risk_free_rate = 0.0
+excess_returns = returns_merged["qmj_ret"].dropna() - risk_free_rate
+monthly_sharpe = excess_returns.mean() / excess_returns.std()
+annualized_sharpe = monthly_sharpe * np.sqrt(12)
+print(f"\nMonthly Sharpe Ratio for QMJ Portfolio: {monthly_sharpe:.4f}")
+print(f"Annualized Sharpe Ratio for QMJ Portfolio: {annualized_sharpe:.4f}")
